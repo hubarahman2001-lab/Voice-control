@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Runner</title>
+<style>
+  body { margin:0; background:#0f172a; color:#e2e8f0; font-family:Arial,sans-serif; text-align:center; }
+  h1 { margin:12px 0 4px; font-size:24px; }
+  #hint { font-size:14px; color:#94a3b8; margin-bottom:8px; }
+  canvas { background:#1e293b; border-radius:12px; width:96%; max-width:800px; touch-action:manipulation; }
+  button { background:#38bdf8; color:#0f172a; border:0; border-radius:8px; padding:12px 22px; font-size:18px; font-weight:bold; margin:8px; }
+  #heard { font-size:18px; height:26px; color:#fbbf24; }
+  #status { font-size:13px; color:#94a3b8; margin:4px 10px; }
+  #meter { width:200px; height:10px; background:#334155; border-radius:5px; margin:6px auto; overflow:hidden; }
+  #bar { height:100%; width:0%; background:#22c55e; }
+</style>
+</head>
+<body>
+<h1>🎤 Voice Runner</h1>
+<div id="hint">Say <b>JUMP</b> to jump, <b>DUCK</b> to duck. Or shout/clap = jump. Keyboard: Space / Down arrow.</div>
+<canvas id="c" width="800" height="300"></canvas>
+<div id="heard">&nbsp;</div>
+<div id="meter"><div id="bar"></div></div>
+<div id="status">Press Start and allow the microphone.</div>
+<button id="start">Start</button>
+
+<script>
+// ---------- Setup ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const heardEl = document.getElementById('heard');
+const statusEl = document.getElementById('status');
+const barEl = document.getElementById('bar');
+const startBtn = document.getElementById('start');
+
+const GROUND = 250;          // y of the ground line
+let player, obstacles, score, speed, running, frame, best = 0;
+
+try { best = parseInt(localStorage.getItem('voiceRunnerBest') || '0', 10) || 0; } catch (e) {}
+
+function resetGame() {
+  player = { x: 80, y: GROUND, w: 40, h: 50, vy: 0, ducking: false, duckUntil: 0 };
+  obstacles = [];
+  score = 0;
+  speed = 6;
+  frame = 0;
+}
+
+// ---------- Actions (what the voice triggers) ----------
+function jump() {
+  if (!running) return;
+  if (player.y >= GROUND) {      // only jump from the ground
+    player.vy = -15;
+    player.ducking = false;
+  }
+}
+
+function duck() {
+  if (!running) return;
+  player.ducking = true;
+  player.duckUntil = performance.now() + 900;   // stay ducked for 0.9 sec
+}
+
+// ---------- Voice commands (speech recognition) ----------
+const lastFired = {};
+function fire(name, fn) {
+  const now = performance.now();
+  if (lastFired[name] && now - lastFired[name] < 600) return;  // avoid double triggers
+  lastFired[name] = now;
+  fn();
+}
+
+function handleWords(text) {
+  text = text.toLowerCase();
+  heardEl.textContent = '🗣 ' + text;
+  if (/\b(jump|up|hop|go)\b/.test(text)) fire('jump', jump);
+  if (/\b(duck|down|low|crouch)\b/.test(text)) fire('duck', duck);
+}
+
+let recog = null;
+function startSpeech() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    statusEl.textContent = 'Speech recognition not supported here. Use Chrome. Loudness + keyboard still work.';
+    return;
+  }
+  recog = new SR();
+  recog.continuous = true;
+  recog.interimResults = true;   // react fast, before the sentence ends
+  recog.lang = 'en-US';
+  recog.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      handleWords(e.results[i][0].transcript);
+    }
+  };
+  recog.onend = () => { if (running) { try { recog.start(); } catch (e) {} } };  // keep listening
+  recog.onerror = (e) => { statusEl.textContent = 'Mic/speech error: ' + e.error; };
+  try { recog.start(); } catch (e) {}
+}
+
+// ---------- Loudness (instant jump on a shout or clap) ----------
+let analyser, volData, loudCooldown = 0;
+async function startLoudness() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ac.createMediaStreamSource(stream);
+    analyser = ac.createAnalyser();
+    analyser.fftSize = 512;
+    volData = new Uint8Array(analyser.fftSize);
+    src.connect(analyser);
+    statusEl.textContent = 'Listening... say JUMP or DUCK!';
+  } catch (e) {
+    statusEl.textContent = 'Microphone blocked. Allow it in the browser, or use the keyboard.';
+  }
+}
+
+function checkLoudness() {
+  if (!analyser) return;
+  analyser.getByteTimeDomainData(volData);
+  let peak = 0;
+  for (let i = 0; i < volData.length; i++) {
+    peak = Math.max(peak, Math.abs(volData[i] - 128));
+  }
+  const level = peak / 128;                 // 0 to 1
+  barEl.style.width = Math.min(100, level * 200) + '%';
+  const now = performance.now();
+  if (level > 0.6 && now > loudCooldown) {  // very loud = jump
+    loudCooldown = now + 500;
+    jump();
+  }
+}
+
+// ---------- Keyboard / tap (for testing) ----------
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); jump(); }
+  if (e.code === 'ArrowDown') { e.preventDefault(); duck(); }
+});
+canvas.addEventListener('pointerdown', jump);
+
+// ---------- Game loop ----------
+function spawnObstacle() {
+  if (Math.random() < 0.5) {
+    // cactus on the ground: jump over it
+    obstacles.push({ type: 'cactus', x: 820, y: GROUND - 40, w: 26, h: 40 });
+  } else {
+    // bird at head height: duck under it
+    obstacles.push({ type: 'bird', x: 820, y: GROUND - 62, w: 40, h: 22 });
+  }
+}
+
+function update() {
+  frame++;
+  score += 0.1;
+  speed = 6 + score / 40;
+
+  // physics
+  player.vy += 0.8;
+  player.y += player.vy;
+  if (player.y > GROUND) { player.y = GROUND; player.vy = 0; }
+  if (player.ducking && performance.now() > player.duckUntil) player.ducking = false;
+
+  // spawn
+  const gap = Math.max(55, 100 - score / 8);
+  if (frame % Math.floor(gap) === 0 && Math.random() < 0.8) spawnObstacle();
+
+  // move + collide
+  const ph = player.ducking ? 25 : player.h;
+  const px = player.x, py = player.y - ph;
+  for (const o of obstacles) {
+    o.x -= speed;
+    if (px < o.x + o.w && px + player.w > o.x && py < o.y + o.h && py + ph > o.y) {
+      gameOver();
+      return;
+    }
+  }
+  obstacles = obstacles.filter(o => o.x > -60);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, 800, 300);
+  // ground
+  ctx.fillStyle = '#475569';
+  ctx.fillRect(0, GROUND, 800, 3);
+
+  // player
+  const ph = player.ducking ? 25 : player.h;
+  ctx.fillStyle = '#38bdf8';
+  ctx.fillRect(player.x, player.y - ph, player.w, ph);
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(player.x + 28, player.y - ph + 8, 6, 6);   // eye
+
+  // obstacles
+  for (const o of obstacles) {
+    ctx.fillStyle = o.type === 'cactus' ? '#22c55e' : '#f87171';
+    ctx.fillRect(o.x, o.y, o.w, o.h);
+  }
+
+  // score
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '18px Arial';
+  ctx.textAlign = 'right';
+  ctx.fillText('Score ' + Math.floor(score) + '   Best ' + best, 780, 28);
+}
+
+function gameOver() {
+  running = false;
+  const s = Math.floor(score);
+  if (s > best) {
+    best = s;
+    try { localStorage.setItem('voiceRunnerBest', String(best)); } catch (e) {}
+  }
+  ctx.fillStyle = 'rgba(15,23,42,0.75)';
+  ctx.fillRect(0, 0, 800, 300);
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 36px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('Game over! Score ' + s, 400, 140);
+  ctx.font = '20px Arial';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fillText('Say "START" or press the button to retry', 400, 180);
+  startBtn.textContent = 'Play again';
+}
+
+function loop() {
+  if (!running) return;
+  checkLoudness();
+  update();
+  if (running) draw();
+  requestAnimationFrame(loop);
+}
+
+// ---------- Start ----------
+let micStarted = false;
+async function begin() {
+  resetGame();
+  running = true;
+  startBtn.textContent = 'Restart';
+  if (!micStarted) {
+    micStarted = true;
+    await startLoudness();
+    startSpeech();
+  }
+  requestAnimationFrame(loop);
+}
+startBtn.addEventListener('click', begin);
+
+// Also let voice restart after game over
+const origHandle = handleWords;
+handleWords = function (text) {
+  if (!running && /\b(start|again|restart)\b/i.test(text) && micStarted) { begin(); return; }
+  origHandle(text);
+};
+
+resetGame();
+draw();
+</script>
+</body>
+</html>
